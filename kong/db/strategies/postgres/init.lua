@@ -871,7 +871,8 @@ function _M.new(connector, schema, errors)
     primary_key_fields_count          = i
   end
 
-  local max_name_length               = 1
+  local ttl                           = schema.name == "routes" or schema.ttl
+  local max_name_length               = ttl and 3 or 1
   local max_type_length               = 1
   local fields                        = {}
   local fields_count                  = 0
@@ -912,8 +913,7 @@ function _M.new(connector, schema, errors)
         end
       end
 
-      --TODO: is CASCADE better default for updates?
-      local on_update = field.on_update --or "CASCADE"
+      local on_update = field.on_update
       if on_update then
         on_update = upper(on_update)
         if on_update ~= "RESTRICT" and
@@ -1208,11 +1208,28 @@ function _M.new(connector, schema, errors)
   primary_key_placeholders = concat(primary_key_placeholders, ", ")
   update_placeholders      = concat(update_placeholders, ", ")
 
-  local create_statement = concat {
-    "CREATE TABLE IF NOT EXISTS ", table_name_escaped, " (\n",
-    "  ",   concat(create_expressions, ",\n  "), "\n",
-    ");\n", concat(foreign_key_indexes, "\n"),
-  }
+  local create_statement
+  local ttl_escaped
+  local ttl_index
+
+  if ttl then
+    ttl_escaped = escape_identifier(connector, "ttl")
+    ttl_index = escape_identifier(connector, table_name .. "_ttl_idx")
+
+    create_statement = concat {
+      "CREATE TABLE IF NOT EXISTS ", table_name_escaped, " (\n",
+      "  ",   concat(create_expressions, ",\n  "), "\n",
+      ");\n", concat(foreign_key_indexes, "\n"), "\n",
+      "CREATE INDEX IF NOT EXISTS ", ttl_index, " ON ", table_name_escaped, " (", ttl_escaped, ");",
+    }
+
+  else
+    create_statement = concat {
+      "CREATE TABLE IF NOT EXISTS ", table_name_escaped, " (\n",
+      "  ",   concat(create_expressions, ",\n  "), "\n",
+      ");\n", concat(foreign_key_indexes, "\n")
+    }
+  end
 
   local insert_statement = concat {
     "INSERT INTO ",  table_name_escaped, " (", insert_columns, ")\n",
@@ -1228,52 +1245,103 @@ function _M.new(connector, schema, errors)
     "  RETURNING ",  select_expressions, ";",
   }
 
-  local select_statement = concat {
-    "SELECT ",  select_expressions, "\n",
-    "  FROM ",  table_name_escaped, "\n",
-    " WHERE (", pk_escaped, ") = (", primary_key_placeholders, ")\n",
-    " LIMIT 1;"
-  }
+  local select_statement
+  local page_first_statement
+  local page_next_statement
+  local update_statement
+  local delete_statement
+  local count_statement
 
-  local page_first_statement = concat {
-    "  SELECT ",  select_expressions, "\n",
-    "    FROM ",  table_name_escaped, "\n",
-    "ORDER BY ",  pk_escaped, "\n",
-    "   LIMIT $1;";
-  }
+  if ttl then
+    select_statement = concat {
+      "SELECT ",  select_expressions, "\n",
+      "  FROM ",  table_name_escaped, "\n",
+      " WHERE (", pk_escaped, ") = (", primary_key_placeholders, ")\n",
+      "   AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP AT TIME ZONE 'UTC')\n",
+      " LIMIT 1;"
+    }
 
-  local page_next_statement = concat {
-    "  SELECT ",  select_expressions, "\n",
-    "    FROM ",  table_name_escaped, "\n",
-    "   WHERE (", pk_escaped, ") > (", primary_key_placeholders, ")\n",
-    "ORDER BY ",  pk_escaped, "\n",
-    "   LIMIT $", page_next_count, ";"
-  }
+    page_first_statement = concat {
+      "  SELECT ",  select_expressions, "\n",
+      "    FROM ",  table_name_escaped, "\n",
+      "   WHERE (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP AT TIME ZONE 'UTC')\n",
+      "ORDER BY ",  pk_escaped, "\n",
+      "   LIMIT $1;";
+    }
 
-  local update_statement = concat {
-    "   UPDATE ",  table_name_escaped, "\n",
-    "      SET ",  concat(update_expressions, ", "), "\n",
-    "    WHERE (", pk_escaped, ") = (", update_placeholders, ")\n",
-    "RETURNING ",  select_expressions , ";"
-  }
+    page_next_statement = concat {
+      "  SELECT ",  select_expressions, "\n",
+      "    FROM ",  table_name_escaped, "\n",
+      "   WHERE (", pk_escaped, ") > (", primary_key_placeholders, ")\n",
+      "     AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP AT TIME ZONE 'UTC')\n",
+      "ORDER BY ",  pk_escaped, "\n",
+      "   LIMIT $", page_next_count, ";"
+    }
 
-  local delete_statement = concat {
-    "DELETE\n",
-    "  FROM ", table_name_escaped, "\n",
-    " WHERE (", pk_escaped, ") = (", primary_key_placeholders, ");",
-  }
+    update_statement = concat {
+      "   UPDATE ",  table_name_escaped, "\n",
+      "      SET ",  concat(update_expressions, ", "), "\n",
+      "    WHERE (", pk_escaped, ") = (", update_placeholders, ")\n",
+      "      AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP AT TIME ZONE 'UTC')\n",
+      "RETURNING ",  select_expressions , ";"
+    }
 
-  local count_accurate_statement = concat {
-    "SELECT COUNT(*) AS count\n",
-    "  FROM ", table_name_escaped, ";"
-  }
+    delete_statement = concat {
+      "DELETE\n",
+      "  FROM ", table_name_escaped, "\n",
+      " WHERE (", pk_escaped, ") = (", primary_key_placeholders, ")",
+      "   AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP AT TIME ZONE 'UTC');",
+    }
 
-  --SEE: https://dzone.com/articles/faster-postgresql-counting
-  local count_estimate_statement = concat {
-    "SELECT (reltuples::BIGINT / COALESCE(NULLIF(relpages::BIGINT, 0), 1)) * (pg_relation_size(", table_name_literal ,") / (current_setting('block_size')::BIGINT)) AS count\n",
-    "  FROM pg_class\n",
-    " WHERE oid = ", table_name_literal, "::regclass;"
-  }
+    count_statement = concat {
+      "SELECT COUNT(*) AS count\n",
+      "  FROM ", table_name_escaped, "\n",
+      " WHERE (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP AT TIME ZONE 'UTC')\n",
+      " LIMIT 1;"
+    }
+
+  else
+    select_statement = concat {
+      "SELECT ",  select_expressions, "\n",
+      "  FROM ",  table_name_escaped, "\n",
+      " WHERE (", pk_escaped, ") = (", primary_key_placeholders, ")\n",
+      " LIMIT 1;"
+    }
+
+    page_first_statement = concat {
+      "  SELECT ", select_expressions, "\n",
+      "    FROM ", table_name_escaped, "\n",
+      "ORDER BY ", pk_escaped, "\n",
+      "   LIMIT $1;";
+    }
+
+    page_next_statement = concat {
+      "  SELECT ",  select_expressions, "\n",
+      "    FROM ",  table_name_escaped, "\n",
+      "   WHERE (", pk_escaped, ") > (", primary_key_placeholders, ")\n",
+      "ORDER BY ",  pk_escaped, "\n",
+      "   LIMIT $", page_next_count, ";"
+    }
+
+    update_statement = concat {
+      "   UPDATE ",  table_name_escaped, "\n",
+      "      SET ",  concat(update_expressions, ", "), "\n",
+      "    WHERE (", pk_escaped, ") = (", update_placeholders, ")\n",
+      "RETURNING ",  select_expressions , ";"
+    }
+
+    delete_statement = concat {
+      "DELETE\n",
+      "  FROM ", table_name_escaped, "\n",
+      " WHERE (", pk_escaped, ") = (", primary_key_placeholders, ");",
+    }
+
+    count_statement = concat {
+      "SELECT COUNT(*) AS count\n",
+      "  FROM ", table_name_escaped, "\n",
+      " LIMIT 1;"
+    }
+  end
 
   local truncate_statement = concat {
     "TRUNCATE ", table_name_escaped, ";"
@@ -1281,15 +1349,29 @@ function _M.new(connector, schema, errors)
 
   local drop_statement
   if foreign_key_count > 0 then
-    drop_statement = concat {
-      "DROP INDEX IF EXISTS ", concat(foreign_key_indexes_escaped, ", "), ";\n",
-      "DROP TABLE IF EXISTS ", table_name_escaped, ";"
-    }
+    if ttl then
+      drop_statement = concat {
+        "DROP INDEX IF EXISTS ", ttl_index, ", ", concat(foreign_key_indexes_escaped, ", "), ";\n",
+        "DROP TABLE IF EXISTS ", table_name_escaped, ";"
+      }
+    else
+      drop_statement = concat {
+        "DROP INDEX IF EXISTS ", concat(foreign_key_indexes_escaped, ", "), ";\n",
+        "DROP TABLE IF EXISTS ", table_name_escaped, ";"
+      }
+    end
 
   else
-    drop_statement = concat {
-      "DROP TABLE IF EXISTS ", table_name_escaped, ";"
-    }
+    if ttl then
+      drop_statement = concat {
+        "DROP INDEX IF EXISTS ", ttl_index, ";\n",
+        "DROP TABLE IF EXISTS ", table_name_escaped, ";"
+      }
+    else
+      drop_statement = concat {
+        "DROP TABLE IF EXISTS ", table_name_escaped, ";"
+      }
+    end
   end
 
   local common_args    = new_tab(primary_key_fields_count, 0)
@@ -1311,8 +1393,7 @@ function _M.new(connector, schema, errors)
       statements       = {
         create         = create_statement,
         truncate       = truncate_statement,
-        count_accurate = count_accurate_statement,
-        count_estimate = count_estimate_statement,
+        count          = count_statement,
         drop           = drop_statement,
         insert         = {
           argn         = insert_names,
@@ -1398,22 +1479,44 @@ function _M.new(connector, schema, errors)
       fk_placeholders = concat(fk_placeholders, ", ")
       pk_placeholders = concat(pk_placeholders, ", ")
 
-      page_first_statement = concat {
-        "  SELECT ",  select_expressions, "\n",
-        "    FROM ",  table_name_escaped, "\n",
-        "   WHERE (", foreign_key_names, ") = (", fk_placeholders, ")\n",
-        "ORDER BY ",  pk_escaped, "\n",
-        "   LIMIT $", argc_first, ";";
-      }
+      if ttl then
+        page_first_statement = concat {
+          "  SELECT ",  select_expressions, "\n",
+          "    FROM ",  table_name_escaped, "\n",
+          "   WHERE (", foreign_key_names, ") = (", fk_placeholders, ")\n",
+          "     AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP AT TIME ZONE 'UTC')\n",
+          "ORDER BY ",  pk_escaped, "\n",
+          "   LIMIT $", argc_first, ";";
+        }
 
-      page_next_statement = concat {
-        "  SELECT ",  select_expressions, "\n",
-        "    FROM ",  table_name_escaped, "\n",
-        "   WHERE (", foreign_key_names, ") = (", fk_placeholders, ")\n",
-        "     AND (", pk_escaped, ") > (", pk_placeholders, ")\n",
-        "ORDER BY ",  pk_escaped, "\n",
-        "   LIMIT $", argc_next, ";"
-      }
+        page_next_statement = concat {
+          "  SELECT ",  select_expressions, "\n",
+          "    FROM ",  table_name_escaped, "\n",
+          "   WHERE (", foreign_key_names, ") = (", fk_placeholders, ")\n",
+          "     AND (", pk_escaped, ") > (", pk_placeholders, ")\n",
+          "     AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP AT TIME ZONE 'UTC')\n",
+          "ORDER BY ",  pk_escaped, "\n",
+          "   LIMIT $", argc_next, ";"
+        }
+
+      else
+        page_first_statement = concat {
+          "  SELECT ",  select_expressions, "\n",
+          "    FROM ",  table_name_escaped, "\n",
+          "   WHERE (", foreign_key_names, ") = (", fk_placeholders, ")\n",
+          "ORDER BY ",  pk_escaped, "\n",
+          "   LIMIT $", argc_first, ";";
+        }
+
+        page_next_statement = concat {
+          "  SELECT ",  select_expressions, "\n",
+          "    FROM ",  table_name_escaped, "\n",
+          "   WHERE (", foreign_key_names, ") = (", fk_placeholders, ")\n",
+          "     AND (", pk_escaped, ") > (", pk_placeholders, ")\n",
+          "ORDER BY ",  pk_escaped, "\n",
+          "   LIMIT $", argc_next, ";"
+        }
+      end
 
       local statement_name = "for_" .. foreign_entity_name
 
@@ -1447,12 +1550,25 @@ function _M.new(connector, schema, errors)
       local single_names   = { unique_name }
 
       local select_by_statement_name = "select_by_" .. unique_name
-      local select_by_statement = concat {
-        "SELECT ", select_expressions, "\n",
-        "  FROM ", table_name_escaped, "\n",
-        " WHERE ", unique_escaped, " = $1\n",
-        " LIMIT 1;"
-      }
+      local select_by_statement
+
+      if ttl then
+        select_by_statement = concat {
+          "SELECT ", select_expressions, "\n",
+          "  FROM ", table_name_escaped, "\n",
+          " WHERE ", unique_escaped, " = $1\n",
+          "   AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP AT TIME ZONE 'UTC')\n",
+          " LIMIT 1;"
+        }
+
+      else
+        select_by_statement = concat {
+          "SELECT ", select_expressions, "\n",
+          "  FROM ", table_name_escaped, "\n",
+          " WHERE ", unique_escaped, " = $1\n",
+          " LIMIT 1;"
+        }
+      end
 
       statements[select_by_statement_name] = {
         argn = single_names,
@@ -1462,12 +1578,25 @@ function _M.new(connector, schema, errors)
       }
 
       local update_by_statement_name = "update_by_" .. unique_name
-      local update_by_statement = concat {
-        "   UPDATE ", table_name_escaped, "\n",
-        "      SET ", concat(update_expressions, ", "), "\n",
-        "    WHERE ", unique_escaped, " = $", update_by_args_count, "\n",
-        "RETURNING ", select_expressions , ";"
-      }
+      local update_by_statement
+
+      if ttl then
+        update_by_statement = concat {
+          "   UPDATE ",  table_name_escaped, "\n",
+          "      SET ",  concat(update_expressions, ", "), "\n",
+          "    WHERE ",  unique_escaped, " = $", update_by_args_count, "\n",
+          "      AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP AT TIME ZONE 'UTC')\n",
+          "RETURNING ",  select_expressions , ";"
+        }
+
+      else
+        update_by_statement = concat {
+          "   UPDATE ", table_name_escaped, "\n",
+          "      SET ", concat(update_expressions, ", "), "\n",
+          "    WHERE ", unique_escaped, " = $", update_by_args_count, "\n",
+          "RETURNING ", select_expressions , ";"
+        }
+      end
 
       local update_by_args_names = {}
 
@@ -1501,11 +1630,23 @@ function _M.new(connector, schema, errors)
       }
 
       local delete_by_statement_name = "delete_by_" .. unique_name
-      local delete_by_statement = concat {
-        "DELETE\n",
-        "  FROM ", table_name_escaped, "\n",
-        " WHERE ", unique_escaped, " = $1;",
-      }
+      local delete_by_statement
+
+      if ttl then
+        delete_by_statement = concat {
+          "DELETE\n",
+          "  FROM ", table_name_escaped, "\n",
+          " WHERE ", unique_escaped, " = $1\n",
+          "   AND (", ttl_escaped, " IS NULL OR ", ttl_escaped, " >= CURRENT_TIMESTAMP AT TIME ZONE 'UTC');",
+        }
+
+      else
+        delete_by_statement = concat {
+          "DELETE\n",
+          "  FROM ", table_name_escaped, "\n",
+          " WHERE ", unique_escaped, " = $1;",
+        }
+      end
 
       statements[delete_by_statement_name] = {
         argn = single_names,
